@@ -29,6 +29,22 @@
 namespace {
 
 uint32_t gCookie = 0;
+constexpr const char* kEmptyPayloadSHA256 =
+  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+int envInt(const char* name, int fallback) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || *value == '\0') {
+    return fallback;
+  }
+  char* end = nullptr;
+  const long parsed = std::strtol(value, &end, 0);
+  if (*end != '\0' || parsed < 0 || parsed > 255) {
+    std::fprintf(stderr, "dp: invalid %s=%s\n", name, value);
+    return -1;
+  }
+  return static_cast<int>(parsed);
+}
 
 int connectTcp(const char* host, int port) {
   char service[16];
@@ -130,6 +146,11 @@ std::string headerValue(const std::string& resp, const std::string& name) {
 int runTransfer(const char* host, int port, const char* op, const char* target,
                 uint64_t size, uint32_t cookie) {
   gCookie = cookie;
+  const int rdmaPort = envInt("HIPOBJ_RDMA_PORT", 1);
+  const int gidIndex = envInt("HIPOBJ_RDMA_GID_INDEX", 0);
+  if (rdmaPort < 1 || gidIndex < 0) {
+    return 2;
+  }
 
   /* ---- verbs setup (client side) ---- */
   int n = 0;
@@ -180,14 +201,18 @@ int runTransfer(const char* host, int port, const char* op, const char* target,
   struct ibv_qp_attr attr = {};
   attr.qp_state = IBV_QPS_INIT;
   attr.pkey_index = 0;
-  attr.port_num = 1;
+  attr.port_num = static_cast<uint8_t>(rdmaPort);
   attr.qp_access_flags = IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
   ibv_modify_qp(qp, &attr,
                 IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT |
                   IBV_QP_ACCESS_FLAGS);
 
   union ibv_gid gid = {};
-  ibv_query_gid(ctx, 1, 0, &gid);
+  if (ibv_query_gid(ctx, static_cast<uint8_t>(rdmaPort), gidIndex, &gid) != 0) {
+    std::fprintf(stderr, "dp: query gid failed for port %d index %d\n",
+                 rdmaPort, gidIndex);
+    return 2;
+  }
 
   /* ---- PREPARE (control, over TCP) ---- */
   char psnHex[8];
@@ -204,7 +229,7 @@ int runTransfer(const char* host, int port, const char* op, const char* target,
                 static_cast<unsigned long long>(size));
 
   hipObj::v2::BuiltinVerifier signer("hipobj-test-key", "hipobj-test-secret",
-                                     "us-east-1");
+                                     "us-east-1", "s3");
   char amzDate[24];
   {
     std::time_t t = std::time(nullptr);
@@ -227,6 +252,7 @@ int runTransfer(const char* host, int port, const char* op, const char* target,
   std::map<std::string, std::string> phdrs = {
     {"host", std::string(host)},
     {"x-amz-date", amzDate},
+    {"x-amz-content-sha256", kEmptyPayloadSHA256},
     {"x-amz-rdma-protocol", "hipobj-rc-v2"},
     {"x-amz-rdma-token", clientTokHex},
     {"x-amz-rdma-psn", psnHex},
@@ -234,6 +260,7 @@ int runTransfer(const char* host, int port, const char* op, const char* target,
     {"x-amz-rdma-op", op},
     {"x-amz-rdma-target", target},
     {"x-amz-rdma-size", sizeDec},
+    {"x-amz-rdma-offset", "0"},
     {"x-amz-rdma-mr-addr", mrAddrHex},
     {"x-amz-rdma-mr-rkey", mrRkeyHex},
     {"x-amz-rdma-qpn", qpnHex},
@@ -257,7 +284,8 @@ int runTransfer(const char* host, int port, const char* op, const char* target,
   close(fd);
   int st = statusOf(presp);
   if (st != 200) {
-    std::fprintf(stderr, "dp: PREPARE status=%d\n", st);
+    std::fprintf(stderr, "dp: PREPARE status=%d response=%s\n", st,
+                 presp.c_str());
     return 1;
   }
   std::string session = headerValue(presp, "x-amz-rdma-session");
@@ -333,9 +361,9 @@ int runTransfer(const char* host, int port, const char* op, const char* target,
      * loopback. */
     attr.ah_attr.is_global = 1;
     attr.ah_attr.grh.dgid = haveServerGid ? serverGid : gid;
-    attr.ah_attr.grh.sgid_index = 0;
+    attr.ah_attr.grh.sgid_index = gidIndex;
     attr.ah_attr.grh.hop_limit = 1;
-    attr.ah_attr.port_num = 1;
+    attr.ah_attr.port_num = static_cast<uint8_t>(rdmaPort);
     ibv_modify_qp(qp, &attr,
                   IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
                     IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC |
@@ -356,6 +384,7 @@ int runTransfer(const char* host, int port, const char* op, const char* target,
   std::map<std::string, std::string> rhdrs = {
     {"host", std::string(host)},
     {"x-amz-date", amzDate},
+    {"x-amz-content-sha256", kEmptyPayloadSHA256},
     {"x-amz-rdma-protocol", "hipobj-rc-v2"},
     {"x-amz-rdma-session", session},
     {"x-amz-rdma-cookie", cookieHex},
@@ -382,8 +411,7 @@ int runTransfer(const char* host, int port, const char* op, const char* target,
     if (std::strcmp(op, "GET") == 0) {
       struct ibv_sge rsge = {};
       rsge.addr = reinterpret_cast<uintptr_t>(buf);
-      rsge.length = static_cast<uint32_t>(size < sizeof(buf) ? size
-                                                             : sizeof(buf));
+      rsge.length = static_cast<uint32_t>(size < 4096 ? size : 4096);
       rsge.lkey = mr->lkey;
       struct ibv_recv_wr rwr = {};
       rwr.wr_id = 0x47455452454356ULL; /* "GETRECV" */
