@@ -192,10 +192,9 @@ std::string extractAuthorization(const std::string& rawHeaders) {
 }
 
 BuiltinVerifier::BuiltinVerifier(std::string accessKey, std::string secretKey,
-                                 std::string region)
+                                 std::string region, std::string service)
   : accessKey_(std::move(accessKey)), secretKey_(std::move(secretKey)),
-    region_(std::move(region)) {
-}
+  region_(std::move(region)), service_(std::move(service)) {}
 
 std::string BuiltinVerifier::sign(
   const std::string& method, const std::string& uri,
@@ -232,7 +231,7 @@ std::string BuiltinVerifier::sign(
   if (date.size() >= 8) {
     date = date.substr(0, 8);
   }
-  std::string scope = date + "/" + region_ + "/hipobj/aws4_request";
+  std::string scope = date + "/" + region_ + "/" + service_ + "/aws4_request";
   std::string canonicalRequest = method + "\n" + uri + "\n" +
                                  std::string() /* no query */ + "\n" +
                                  canonicalHeaders + "\n" + signedList + "\n" +
@@ -241,7 +240,7 @@ std::string BuiltinVerifier::sign(
                        sha256Hex(canonicalRequest);
   std::string kDate = hmacSha256("AWS4" + secretKey_, date.substr(0, 8));
   std::string kRegion = hmacSha256(kDate, region_);
-  std::string kService = hmacSha256(kRegion, "hipobj");
+  std::string kService = hmacSha256(kRegion, service_);
   std::string kSigning = hmacSha256(kService, "aws4_request");
   std::string signature = hex(reinterpret_cast<const unsigned char*>(
                                 hmacSha256(kSigning, toSign).data()),
@@ -264,7 +263,7 @@ std::optional<VerifiedCredential> BuiltinVerifier::verify(
   std::string service;
   std::string terminator;
   if (!parseCredential(auth, key, date, region, service, terminator) ||
-      key != accessKey_ || region != region_ || service != "hipobj" ||
+      key != accessKey_ || region != region_ || service != service_ ||
       terminator != "aws4_request") {
     return std::nullopt;
   }
@@ -329,7 +328,7 @@ std::optional<VerifiedCredential> BuiltinVerifier::verify(
     }
   }
   std::string payloadHash = sha256Hex(body);
-  std::string scope = date + "/" + region_ + "/hipobj/aws4_request";
+  std::string scope = date + "/" + region_ + "/" + service_ + "/aws4_request";
   std::string canonicalRequest = method + "\n" + uri + "\n" + std::string() +
                                  "\n" + canonicalHeaderLines + "\n" +
                                  signedList + "\n" + payloadHash;
@@ -337,7 +336,7 @@ std::optional<VerifiedCredential> BuiltinVerifier::verify(
                        sha256Hex(canonicalRequest);
   std::string kDate = hmacSha256("AWS4" + secretKey_, date.substr(0, 8));
   std::string kRegion = hmacSha256(kDate, region_);
-  std::string kService = hmacSha256(kRegion, "hipobj");
+  std::string kService = hmacSha256(kRegion, service_);
   std::string kSigning = hmacSha256(kService, "aws4_request");
   std::string signature = hex(reinterpret_cast<const unsigned char*>(
                                 hmacSha256(kSigning, toSign).data()),

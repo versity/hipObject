@@ -42,7 +42,7 @@ public:
 class BuiltinVerifier : public SigV4Verifier {
 public:
   BuiltinVerifier(std::string accessKey, std::string secretKey,
-                  std::string region);
+                  std::string region, std::string service = "hipobj");
 
   std::optional<VerifiedCredential> verify(const std::string& method,
                                            const std::string& uri,
@@ -62,6 +62,7 @@ private:
   std::string accessKey_;
   std::string secretKey_;
   std::string region_;
+  std::string service_;
 };
 
 /* Extracts the raw Authorization value from a header block
